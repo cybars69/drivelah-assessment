@@ -1,186 +1,94 @@
-# Voucher & Promotion Management API
+# Voucher & Promotion API
 
-A minimal, practical Node.js + Express API for managing vouchers and promotions with MongoDB.
+A Node.js API for managing vouchers and promotions with discount calculation logic.
 
-## Features
-
-- CRUD operations for vouchers and promotions
-- Apply discounts to orders with validation
-- Enforce business rules (expiration, usage limits, minimum order value, eligible categories)
-- Cap maximum discount at 50% of order value
-- Atomic usage count increments to prevent race conditions
-- Rate limiting (in-memory for dev)
-- Input validation with Joi
-- Basic tests with Jest + SuperTest
-
-## Tech Stack
-
-- **Framework**: Express.js
-- **Database**: MongoDB with Mongoose
-- **Validation**: Joi
-- **Rate Limiting**: express-rate-limit (in-memory)
-- **Testing**: Jest + SuperTest
-
-## Prerequisites
-
-- Node.js (v16+)
-- MongoDB (local or cloud instance)
-
-## Installation
+## Setup
 
 ```bash
-# Install dependencies
 npm install
-
-# Copy environment variables
 cp .env.example .env
-
 # Edit .env with your MongoDB URI
-# MONGODB_URI=mongodb://localhost:27017/voucher-api
-# PORT=3000
+npm run seed    # Optional: add sample data
+npm run dev     # Start server
+npm test        # Run tests
 ```
 
-## Running the Application
+## What It Does
 
-```bash
-# Development mode with auto-reload
-npm run dev
+Manages vouchers (site-wide discounts) and promotions (category/item-specific discounts). Calculates order totals with applied discounts while enforcing business rules.
 
-# Production mode
-npm start
+## Key Logic & Edge Cases
 
-# Seed sample data
-npm run seed
+### Discount Application Priority
 
-# Run tests
-npm test
+When a code is provided, the system checks promotions first, then vouchers. This allows category-specific deals to take precedence over generic discounts.
+
+**Why?** Promotions are more targeted and typically offer better value for specific items. Checking them first ensures customers get the best applicable deal.
+
+### Atomic Usage Tracking
+
+Usage counts are incremented using MongoDB's conditional update with the current usage count in the query:
+
+```javascript
+findOneAndUpdate(
+  { _id: id, uses: currentUses },  // Only update if uses hasn't changed
+  { $inc: { uses: 1 } }
+)
 ```
 
-## API Endpoints
+**Edge case handled:** Two users applying the same code simultaneously when only 1 use remains. The second request fails gracefully instead of exceeding the limit.
 
-### Vouchers
+### 50% Maximum Discount Cap
 
-- `POST /vouchers` - Create a voucher
-- `GET /vouchers` - List all vouchers (query: ?active=true or ?expired=true)
-- `GET /vouchers/:code` - Get voucher by code
-- `PUT /vouchers/:id` - Update voucher
-- `DELETE /vouchers/:id` - Delete voucher
+Total discount is capped at 50% of the subtotal, regardless of voucher/promotion value.
 
-### Promotions
+**Why?** Prevents abuse scenarios like stacking multiple discounts or using percentage-based codes on already-discounted items that could result in negative totals or excessive losses.
 
-- `POST /promotions` - Create a promotion
-- `GET /promotions` - List all promotions (query: ?active=true or ?expired=true)
-- `GET /promotions/:code` - Get promotion by code
-- `PUT /promotions/:id` - Update promotion
-- `DELETE /promotions/:id` - Delete promotion
+### Proportional Discount Distribution
 
-### Orders
+For promotions with eligible categories, the discount is distributed proportionally across eligible items only:
 
-- `POST /orders/apply` - Apply voucher/promotion and calculate discount
-- `POST /orders` - Create order with applied discounts
-
-## Example Requests
-
-### Create a Voucher
-
-```bash
-curl -X POST http://localhost:3000/vouchers \
-  -H "Content-Type: application/json" \
-  -d '{
-    "code": "SAVE20",
-    "type": "percentage",
-    "value": 20,
-    "expiresAt": "2025-12-31T23:59:59Z",
-    "usageLimit": 100,
-    "minOrderValue": 50
-  }'
+```javascript
+itemDiscount = totalDiscount * (itemTotal / eligibleAmount)
 ```
 
-### Create a Promotion
+**Edge case handled:** Mixed cart with eligible and non-eligible items. Only eligible items receive the discount, proportional to their contribution to the eligible subtotal.
 
-```bash
-curl -X POST http://localhost:3000/promotions \
-  -H "Content-Type: application/json" \
-  -d '{
-    "code": "ELECTRONICS25",
-    "eligibleCategories": ["electronics"],
-    "type": "percentage",
-    "value": 25,
-    "expiresAt": "2025-12-31T23:59:59Z",
-    "usageLimit": 200
-  }'
-```
+### Code Generation with Collision Handling
 
-### Apply Discount to Order
+Auto-generated codes retry up to 10 times if a collision occurs:
 
-```bash
-curl -X POST http://localhost:3000/orders/apply \
-  -H "Content-Type: application/json" \
-  -d '{
-    "items": [
-      {
-        "productId": "507f1f77bcf86cd799439011",
-        "category": "electronics",
-        "price": 100,
-        "qty": 2
-      }
-    ],
-    "voucherCode": "SAVE20"
-  }'
-```
-
-Response:
-```json
-{
-  "subTotal": 200,
-  "discounts": [
-    {
-      "type": "voucher",
-      "code": "SAVE20",
-      "amount": 40
-    }
-  ],
-  "totalDiscount": 40,
-  "finalTotal": 160
+```javascript
+while (!codeGenerated && attempts < maxAttempts) {
+  code = generateCode();
+  if (!existingCode) codeGenerated = true;
+  attempts++;
 }
 ```
 
-## Business Rules
+**Edge case handled:** As the database grows, random code collisions become more likely. The retry mechanism ensures codes are eventually unique without manual intervention.
 
-1. **Expiration**: Codes must not be expired
-2. **Usage Limits**: Global usage count enforced atomically
-3. **One Code Per Type**: One voucher + one promotion max per order
-4. **Minimum Order Value**: Optional minimum subtotal requirement
-5. **Eligible Categories**: Promotions can target specific product categories
-6. **Maximum Discount**: Total discount capped at 50% of subtotal
-7. **Atomic Updates**: Race-condition-safe usage increments
+### Soft Deletes
 
-## Project Structure
+Vouchers and promotions use `deletedAt` timestamps instead of hard deletes.
 
-```
-/src
-  /models          # Mongoose schemas
-  /routes          # Express route handlers
-  /services        # Business logic
-  /validators      # Joi validation schemas
-  app.js           # Express app setup
-  server.js        # Server entry point
-/scripts
-  seed.js          # Database seeding
-/tests
-  apply.test.js    # Integration tests
-```
+**Why?** Preserves historical order data. Orders reference codes that may later be "deleted" but still need to be queryable for reporting and auditing.
 
-## Production Considerations
+### Validation Order
 
-- **Rate Limiting**: Replace express-rate-limit with Redis-backed solution (rate-limiter-flexible)
-- **Authentication**: Add JWT-based auth for protected endpoints
-- **Logging**: Implement structured logging (Winston, Pino)
-- **Monitoring**: Add APM and error tracking
-- **Database**: Use connection pooling and indexes
-- **Caching**: Cache frequently accessed vouchers/promotions
-- **Validation**: Add more comprehensive input sanitization
+Checks happen in this sequence: expiration -> usage limit -> minimum order value -> eligible items.
 
-## License
+**Why?** Fail fast on the cheapest checks first. No point calculating eligible amounts if the code is already expired or maxed out.
 
-MIT
+## Important API Endpoints
+
+- `POST /vouchers` - Create voucher
+- `GET /vouchers` - List vouchers (query: ?status=active|expired|deleted)
+- `POST /promotions` - Create promotion
+- `GET /promotions` - List promotions (query: ?status=active|expired|deleted)
+- `POST /orders/apply` - Calculate discount preview
+- `POST /orders` - Create order with discount applied
+
+## Tech Stack
+
+Express, MongoDB (Mongoose), Joi validation, Jest testing
